@@ -255,7 +255,15 @@ int main(int argc, char* argv[])
         find_aabbs_naive<<<grid, block>>>(d_seg, d_min_x, d_min_y, d_max_x, d_max_y, w, h);
     }, "find_aabbs_naive");
 
-    float shared_ms = time_kernel([&]() {
+    // Snapshot naive results before resetting for the next kernel.
+    std::vector<int> ref_min_x(MAX_IDS), ref_min_y(MAX_IDS);
+    std::vector<int> ref_max_x(MAX_IDS), ref_max_y(MAX_IDS);
+    CUDA_CHECK(cudaMemcpy(ref_min_x.data(), d_min_x, MAX_IDS*sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(ref_min_y.data(), d_min_y, MAX_IDS*sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(ref_max_x.data(), d_max_x, MAX_IDS*sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(ref_max_y.data(), d_max_y, MAX_IDS*sizeof(int), cudaMemcpyDeviceToHost));
+
+    time_kernel([&]() {
         find_aabbs_shared<<<grid, block>>>(d_seg, d_min_x, d_min_y, d_max_x, d_max_y, w, h);
     }, "find_aabbs_shared");
 
@@ -267,6 +275,23 @@ int main(int argc, char* argv[])
     CUDA_CHECK(cudaMemcpy(h_min_y.data(), d_min_y, MAX_IDS*sizeof(int), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_max_x.data(), d_max_x, MAX_IDS*sizeof(int), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_max_y.data(), d_max_y, MAX_IDS*sizeof(int), cudaMemcpyDeviceToHost));
+
+    // Verify find_aabbs_shared produces identical results to find_aabbs_naive.
+    int mismatches = 0;
+    for (int id = 1; id < MAX_IDS; ++id) {
+        if (h_min_x[id] != ref_min_x[id] || h_min_y[id] != ref_min_y[id] ||
+            h_max_x[id] != ref_max_x[id] || h_max_y[id] != ref_max_y[id]) {
+            fprintf(stderr, "MISMATCH id=%d  naive=(%d,%d,%d,%d)  shared=(%d,%d,%d,%d)\n",
+                    id,
+                    ref_min_x[id], ref_min_y[id], ref_max_x[id], ref_max_y[id],
+                    h_min_x[id],   h_min_y[id],   h_max_x[id],   h_max_y[id]);
+            ++mismatches;
+        }
+    }
+    if (mismatches == 0)
+        printf("\nCorrectness check: PASS (find_aabbs_shared matches naive)\n");
+    else
+        fprintf(stderr, "\nCorrectness check: FAIL (%d mismatches)\n", mismatches);
 
     printf("\nID    x0    y0    x1    y1   width  height\n");
     printf("---------------------------------------------\n");
