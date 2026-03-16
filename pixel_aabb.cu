@@ -1,6 +1,6 @@
 // pixel_aabb.cu
 //
-// GPU pixel-AABB finder -- two kernel implementations:
+// GPU pixel-AABB finder -- three kernel implementations:
 //
 //   find_aabbs_naive   -- baseline: one thread per pixel, four global atomics
 //                         per non-background pixel.  Heavy L2 atomic contention.
@@ -9,6 +9,14 @@
 //                         Threads reduce into shared memory first, then one
 //                         thread per unique object ID in the block issues a
 //                         single set of four global atomics.
+//
+//   find_aabbs_tiled   -- optimisation 2: each thread processes a 2x2 tile.
+//                         Bounds are accumulated in registers across consecutive
+//                         same-ID pixels; a shared-memory atomic is only issued
+//                         when the ID changes or the tile ends.  For spatially
+//                         coherent objects (the common case), each thread issues
+//                         one commit instead of four, cutting MIO queue pressure.
+//                         The 4x fewer blocks also reduce phase-1 init overhead.
 //
 // Loads a grayscale segmentation PNG (pixel value = object ID, 0 = background).
 //
@@ -162,6 +170,121 @@ __global__ void find_aabbs_shared(
     }
 }
 
+// --- Kernel 3: 2x2 tile with register-level run accumulation -----------------
+//
+// Each thread owns a 2x2 tile of pixels.  It scans the four pixels in row-major
+// order and tracks a "current run": consecutive pixels with the same non-zero ID.
+// Bounds are accumulated in registers; a commit to shared memory only happens
+// when the ID changes (or the tile ends).
+//
+// Best case (uniform tile, one object): 1 shared-memory commit per thread
+//   instead of 4 -- a 4x reduction in MIO queue pressure for phase 2.
+// Worst case (all four pixels different IDs): same as find_aabbs_shared.
+// Typical case (spatially coherent objects): close to best case.
+//
+// Grid is ceil(w/32) x ceil(h/32) -- 4x fewer blocks than find_aabbs_shared --
+// so phase-1 initialisation overhead (the five shared-memory array writes per
+// block) also drops by 4x.
+//
+// Profiler expectations (vs find_aabbs_shared at 142 us):
+//   - MIO Throttle should drop from ~45% toward ~10-15%
+//   - Phase-1 init cost drops from 5.24M to ~1.31M shared-memory writes
+//   - Kernel duration target: ~30-60 us (2-5x improvement)
+
+__global__ void find_aabbs_tiled(
+    const int* __restrict__ seg,   // [h x w] object IDs, uploaded as int
+    int* min_x, int* min_y,        // [MAX_IDS] lower bounds
+    int* max_x, int* max_y,        // [MAX_IDS] upper bounds
+    int w, int h)
+{
+    __shared__ int s_min_x[MAX_IDS];
+    __shared__ int s_min_y[MAX_IDS];
+    __shared__ int s_max_x[MAX_IDS];
+    __shared__ int s_max_y[MAX_IDS];
+    __shared__ int s_seen[MAX_IDS];        // 0 = ID not yet seen in this block
+    __shared__ int s_unique_ids[MAX_IDS];  // compact list of IDs seen
+    __shared__ int s_unique_count;         // length of s_unique_ids
+
+    const int tid        = threadIdx.y * blockDim.x + threadIdx.x;
+    const int block_size = blockDim.x * blockDim.y;
+
+    // -- phase 1: initialise shared memory ------------------------------------
+    for (int i = tid; i < MAX_IDS; i += block_size) {
+        s_min_x[i] = INT_MAX;
+        s_min_y[i] = INT_MAX;
+        s_max_x[i] = INT_MIN;
+        s_max_y[i] = INT_MIN;
+        s_seen[i]  = 0;
+    }
+    if (tid == 0) s_unique_count = 0;
+    __syncthreads();
+
+    // -- phase 2: scan 2x2 tile, committing to shared on ID change ------------
+    //
+    // This thread's tile top-left pixel:
+    const int px = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
+    const int py = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
+
+    // Flush one accumulated run to shared memory.
+    // Macro avoids a function call; the compiler will inline it at each site.
+#define COMMIT(id, mnx, mny, mxx, mxy)                         \
+    do {                                                        \
+        atomicMin(&s_min_x[id], mnx);                          \
+        atomicMin(&s_min_y[id], mny);                          \
+        atomicMax(&s_max_x[id], mxx);                          \
+        atomicMax(&s_max_y[id], mxy);                          \
+        if (atomicExch(&s_seen[id], 1) == 0) {                 \
+            int _slot = atomicAdd(&s_unique_count, 1);         \
+            s_unique_ids[_slot] = id;                          \
+        }                                                       \
+    } while (0)
+
+    // Process one pixel (cx, cy) and update the running accumulation.
+    // cur_id == 0 means "no active run".
+#define PROCESS_PIXEL(dx, dy)                                          \
+    do {                                                               \
+        const int cx = px + (dx);                                      \
+        const int cy = py + (dy);                                      \
+        const int id = (cx < w && cy < h) ? seg[cy * w + cx] : 0;    \
+        if (id != 0 && id == cur_id) {                                 \
+            /* Extend current run -- no atomic, pure register work */  \
+            if (cx < lmnx) lmnx = cx;                                  \
+            if (cy < lmny) lmny = cy;                                  \
+            if (cx > lmxx) lmxx = cx;                                  \
+            if (cy > lmxy) lmxy = cy;                                  \
+        } else {                                                       \
+            if (cur_id != 0) COMMIT(cur_id, lmnx, lmny, lmxx, lmxy); \
+            cur_id = id;                                               \
+            lmnx = cx; lmny = cy; lmxx = cx; lmxy = cy;               \
+        }                                                              \
+    } while (0)
+
+    int cur_id = 0;              // 0 = no active run
+    int lmnx, lmny, lmxx, lmxy; // register-level bounds for current run
+
+    PROCESS_PIXEL(0, 0);
+    PROCESS_PIXEL(1, 0);
+    PROCESS_PIXEL(0, 1);
+    PROCESS_PIXEL(1, 1);
+
+    // Flush the final run (if the tile ended mid-run).
+    if (cur_id != 0) COMMIT(cur_id, lmnx, lmny, lmxx, lmxy);
+
+#undef PROCESS_PIXEL
+#undef COMMIT
+
+    __syncthreads();
+
+    // -- phase 3: flush local results to global memory ------------------------
+    if (tid < s_unique_count) {
+        const int id = s_unique_ids[tid];
+        atomicMin(&min_x[id], s_min_x[id]);
+        atomicMin(&min_y[id], s_min_y[id]);
+        atomicMax(&max_x[id], s_max_x[id]);
+        atomicMax(&max_y[id], s_max_y[id]);
+    }
+}
+
 // --- Main --------------------------------------------------------------------
 
 int main(int argc, char* argv[])
@@ -214,14 +337,23 @@ int main(int argc, char* argv[])
     // -- 4. Configure launch --------------------------------------------------
     //
     // 16x16 = 256 threads/block is a common starting point for 2-D kernels.
-    // The profiler will tell us whether occupancy is the binding constraint.
     dim3 block(16, 16);
+
+    // find_aabbs_naive / find_aabbs_shared: one thread per pixel.
     dim3 grid((w + block.x - 1) / block.x,
               (h + block.y - 1) / block.y);
 
-    printf("Launch config: grid(%u, %u)  block(%u, %u)  = %u total threads\n",
+    // find_aabbs_tiled: one thread per 2x2 tile.
+    // ceil(w/2) tiles along x, ceil(h/2) along y; then ceil those by block dim.
+    dim3 grid_tiled(((w + 1) / 2 + block.x - 1) / block.x,
+                    ((h + 1) / 2 + block.y - 1) / block.y);
+
+    printf("Launch config (naive/shared): grid(%u, %u)  block(%u, %u)  = %u threads\n",
            grid.x, grid.y, block.x, block.y,
            grid.x * grid.y * block.x * block.y);
+    printf("Launch config (tiled):        grid(%u, %u)  block(%u, %u)  = %u threads\n",
+           grid_tiled.x, grid_tiled.y, block.x, block.y,
+           grid_tiled.x * grid_tiled.y * block.x * block.y);
 
     cudaEvent_t ev_start, ev_stop;
     CUDA_CHECK(cudaEventCreate(&ev_start));
@@ -247,7 +379,7 @@ int main(int argc, char* argv[])
         return ms;
     };
 
-    // -- 5. Run and time both kernels -----------------------------------------
+    // -- 5. Run and time all three kernels ------------------------------------
     printf("\n%-30s  %s\n", "Kernel", "Time");
     printf("----------------------------------------------\n");
 
@@ -267,31 +399,68 @@ int main(int argc, char* argv[])
         find_aabbs_shared<<<grid, block>>>(d_seg, d_min_x, d_min_y, d_max_x, d_max_y, w, h);
     }, "find_aabbs_shared");
 
+    // Correctness check: find_aabbs_shared vs naive reference.
+    {
+        std::vector<int> t_min_x(MAX_IDS), t_min_y(MAX_IDS);
+        std::vector<int> t_max_x(MAX_IDS), t_max_y(MAX_IDS);
+        CUDA_CHECK(cudaMemcpy(t_min_x.data(), d_min_x, MAX_IDS*sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(t_min_y.data(), d_min_y, MAX_IDS*sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(t_max_x.data(), d_max_x, MAX_IDS*sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(t_max_y.data(), d_max_y, MAX_IDS*sizeof(int), cudaMemcpyDeviceToHost));
+        int mismatches = 0;
+        for (int id = 1; id < MAX_IDS; ++id) {
+            if (t_min_x[id] != ref_min_x[id] || t_min_y[id] != ref_min_y[id] ||
+                t_max_x[id] != ref_max_x[id] || t_max_y[id] != ref_max_y[id]) {
+                fprintf(stderr, "MISMATCH id=%d  naive=(%d,%d,%d,%d)  shared=(%d,%d,%d,%d)\n",
+                        id,
+                        ref_min_x[id], ref_min_y[id], ref_max_x[id], ref_max_y[id],
+                        t_min_x[id],   t_min_y[id],   t_max_x[id],   t_max_y[id]);
+                ++mismatches;
+            }
+        }
+        if (mismatches == 0)
+            printf("Correctness check: PASS (find_aabbs_shared matches naive)\n");
+        else
+            fprintf(stderr, "Correctness check: FAIL (%d mismatches)\n", mismatches);
+    }
+
+    time_kernel([&]() {
+        find_aabbs_tiled<<<grid_tiled, block>>>(d_seg, d_min_x, d_min_y, d_max_x, d_max_y, w, h);
+    }, "find_aabbs_tiled");
+
+    // Correctness check: find_aabbs_tiled vs naive reference.
+    {
+        std::vector<int> t_min_x(MAX_IDS), t_min_y(MAX_IDS);
+        std::vector<int> t_max_x(MAX_IDS), t_max_y(MAX_IDS);
+        CUDA_CHECK(cudaMemcpy(t_min_x.data(), d_min_x, MAX_IDS*sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(t_min_y.data(), d_min_y, MAX_IDS*sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(t_max_x.data(), d_max_x, MAX_IDS*sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(t_max_y.data(), d_max_y, MAX_IDS*sizeof(int), cudaMemcpyDeviceToHost));
+        int mismatches = 0;
+        for (int id = 1; id < MAX_IDS; ++id) {
+            if (t_min_x[id] != ref_min_x[id] || t_min_y[id] != ref_min_y[id] ||
+                t_max_x[id] != ref_max_x[id] || t_max_y[id] != ref_max_y[id]) {
+                fprintf(stderr, "MISMATCH id=%d  naive=(%d,%d,%d,%d)  tiled=(%d,%d,%d,%d)\n",
+                        id,
+                        ref_min_x[id], ref_min_y[id], ref_max_x[id], ref_max_y[id],
+                        t_min_x[id],   t_min_y[id],   t_max_x[id],   t_max_y[id]);
+                ++mismatches;
+            }
+        }
+        if (mismatches == 0)
+            printf("Correctness check: PASS (find_aabbs_tiled matches naive)\n");
+        else
+            fprintf(stderr, "Correctness check: FAIL (%d mismatches)\n", mismatches);
+    }
+
     // -- 6. Download and print results ----------------------------------------
-    // Results in the bound arrays are from the last kernel (find_aabbs_shared).
+    // Results in the bound arrays are from the last kernel (find_aabbs_tiled).
     std::vector<int> h_min_x(MAX_IDS), h_min_y(MAX_IDS);
     std::vector<int> h_max_x(MAX_IDS), h_max_y(MAX_IDS);
     CUDA_CHECK(cudaMemcpy(h_min_x.data(), d_min_x, MAX_IDS*sizeof(int), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_min_y.data(), d_min_y, MAX_IDS*sizeof(int), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_max_x.data(), d_max_x, MAX_IDS*sizeof(int), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_max_y.data(), d_max_y, MAX_IDS*sizeof(int), cudaMemcpyDeviceToHost));
-
-    // Verify find_aabbs_shared produces identical results to find_aabbs_naive.
-    int mismatches = 0;
-    for (int id = 1; id < MAX_IDS; ++id) {
-        if (h_min_x[id] != ref_min_x[id] || h_min_y[id] != ref_min_y[id] ||
-            h_max_x[id] != ref_max_x[id] || h_max_y[id] != ref_max_y[id]) {
-            fprintf(stderr, "MISMATCH id=%d  naive=(%d,%d,%d,%d)  shared=(%d,%d,%d,%d)\n",
-                    id,
-                    ref_min_x[id], ref_min_y[id], ref_max_x[id], ref_max_y[id],
-                    h_min_x[id],   h_min_y[id],   h_max_x[id],   h_max_y[id]);
-            ++mismatches;
-        }
-    }
-    if (mismatches == 0)
-        printf("\nCorrectness check: PASS (find_aabbs_shared matches naive)\n");
-    else
-        fprintf(stderr, "\nCorrectness check: FAIL (%d mismatches)\n", mismatches);
 
     printf("\nID    x0    y0    x1    y1   width  height\n");
     printf("---------------------------------------------\n");
