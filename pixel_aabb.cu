@@ -1,10 +1,16 @@
 // pixel_aabb.cu
 //
-// Naive GPU pixel-AABB finder.
+// GPU pixel-AABB finder -- two kernel implementations:
 //
-// Loads a grayscale segmentation PNG (pixel value = object ID, 0 = background),
-// then launches one CUDA thread per pixel. Each thread atomically widens the
-// AABB for its object in four global arrays (min_x, min_y, max_x, max_y).
+//   find_aabbs_naive   -- baseline: one thread per pixel, four global atomics
+//                         per non-background pixel.  Heavy L2 atomic contention.
+//
+//   find_aabbs_shared  -- optimisation 1: per-block shared-memory reduction.
+//                         Threads reduce into shared memory first, then one
+//                         thread per unique object ID in the block issues a
+//                         single set of four global atomics.
+//
+// Loads a grayscale segmentation PNG (pixel value = object ID, 0 = background).
 //
 // Usage:  pixel_aabb [path/to/segmentation.png]
 //         Defaults to assets/segmentation.png relative to the source tree (absolute
@@ -12,9 +18,6 @@
 //
 // Outputs:
 //   result.png  -- colourised segmentation with white bounding-box overlays
-//
-// This deliberately simple baseline is the starting point for a
-// profiler-driven optimisation exercise using Nsight Systems / Compute.
 
 #include <cuda_runtime.h>
 #include "stb_image.h"
@@ -43,19 +46,17 @@ static constexpr int MAX_IDS = 256;
         }                                                                       \
     } while (0)
 
-// --- CUDA kernel -------------------------------------------------------------
+// --- Kernel 1: naive baseline ------------------------------------------------
 //
-// Naive baseline:
-//   - One thread per pixel.
-//   - Each thread atomically reduces into four global arrays.
+// One thread per pixel. Each non-background thread issues four atomics directly
+// into global memory. All threads for the same object contend on the same four
+// addresses in L2, serialising the atomic queue and leaving SMs ~99% idle.
 //
-// Known bottlenecks (to be revealed by the profiler):
-//   - Heavy atomic contention -- all threads for the same object race on the
-//     same four memory locations in global memory.
-//   - No spatial locality exploitation -- nearby threads that belong to the
-//     same object could instead reduce locally (e.g. per-block) first.
-//   - The segmentation is stored as int (4 bytes/pixel) even though IDs fit
-//     in a uint8_t (1 byte/pixel), wasting 4x global memory bandwidth on reads.
+// Profiler findings (RTX 2070, 1024x1024 image, 20 objects):
+//   - Kernel time:            ~450 us
+//   - LG Throttle stall:       71.6% of warp cycles
+//   - SM utilisation:           0.87%
+//   - Warp cycles per issue:  775 (ideal: ~4-8)
 
 __global__ void find_aabbs_naive(
     const int* __restrict__ seg,   // [h x w] object IDs, uploaded as int
@@ -74,6 +75,91 @@ __global__ void find_aabbs_naive(
     atomicMin(&min_y[id], y);
     atomicMax(&max_x[id], x);
     atomicMax(&max_y[id], y);
+}
+
+// --- Kernel 2: per-block shared-memory reduction -----------------------------
+//
+// Three phases:
+//
+//   Phase 1 -- initialise shared memory.
+//     Each thread initialises one entry of each shared array (stride loop so
+//     correctness does not depend on block size == MAX_IDS).
+//
+//   Phase 2 -- reduce into shared memory.
+//     Each thread updates s_min/s_max with shared-memory atomics (low latency,
+//     on-chip, no LG queue pressure). Simultaneously, the first thread to
+//     encounter each ID registers it in s_unique_ids via atomicExch, ensuring
+//     exactly one entry per unique ID with no duplicates.
+//
+//   Phase 3 -- flush to global memory.
+//     Only s_unique_count threads execute -- one per unique ID found in this
+//     block. Each issues exactly four global atomics for its ID.
+//     Global atomic count per block: s_unique_count * 4 (typically 4-16)
+//     instead of up to block_size * 4 (up to 1024) in the naive version.
+//
+// Shared memory per block: 6 * MAX_IDS * 4 bytes = 6 KB.
+// Occupancy impact: none -- warp count is the binding constraint, not smem.
+
+__global__ void find_aabbs_shared(
+    const int* __restrict__ seg,   // [h x w] object IDs, uploaded as int
+    int* min_x, int* min_y,        // [MAX_IDS] lower bounds
+    int* max_x, int* max_y,        // [MAX_IDS] upper bounds
+    int w, int h)
+{
+    __shared__ int s_min_x[MAX_IDS];
+    __shared__ int s_min_y[MAX_IDS];
+    __shared__ int s_max_x[MAX_IDS];
+    __shared__ int s_max_y[MAX_IDS];
+    __shared__ int s_seen[MAX_IDS];        // 0 = ID not yet seen in this block
+    __shared__ int s_unique_ids[MAX_IDS];  // compact list of IDs seen
+    __shared__ int s_unique_count;         // length of s_unique_ids
+
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int block_size = blockDim.x * blockDim.y;
+
+    // -- phase 1: initialise shared memory ------------------------------------
+    for (int i = tid; i < MAX_IDS; i += block_size) {
+        s_min_x[i] = INT_MAX;
+        s_min_y[i] = INT_MAX;
+        s_max_x[i] = INT_MIN;
+        s_max_y[i] = INT_MIN;
+        s_seen[i]  = 0;
+    }
+    if (tid == 0) s_unique_count = 0;
+    __syncthreads();
+
+    // -- phase 2: reduce into shared memory -----------------------------------
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x < w && y < h) {
+        int id = seg[y * w + x];
+        if (id != 0) {
+            atomicMin(&s_min_x[id], x);
+            atomicMin(&s_min_y[id], y);
+            atomicMax(&s_max_x[id], x);
+            atomicMax(&s_max_y[id], y);
+
+            // Register this ID exactly once per block.
+            // atomicExch returns the old value; if it was 0 this thread wins
+            // the race and claims the slot -- all later threads see 1 and skip.
+            if (atomicExch(&s_seen[id], 1) == 0) {
+                int slot = atomicAdd(&s_unique_count, 1);
+                s_unique_ids[slot] = id;
+            }
+        }
+    }
+    __syncthreads();
+
+    // -- phase 3: flush local results to global memory ------------------------
+    // One thread per unique ID -- typically only 1-4 threads do any work here.
+    if (tid < s_unique_count) {
+        int id = s_unique_ids[tid];
+        atomicMin(&min_x[id], s_min_x[id]);
+        atomicMin(&min_y[id], s_min_y[id]);
+        atomicMax(&max_x[id], s_max_x[id]);
+        atomicMax(&max_y[id], s_max_y[id]);
+    }
 }
 
 // --- Main --------------------------------------------------------------------
@@ -137,31 +223,44 @@ int main(int argc, char* argv[])
            grid.x, grid.y, block.x, block.y,
            grid.x * grid.y * block.x * block.y);
 
-    // -- 5. Warm-up run (excluded from timing) --------------------------------
-    //
-    // Absorbs driver init, JIT compilation, and any first-launch overhead so
-    // the timed run below reflects steady-state kernel performance.
-    reset_bounds();
-    find_aabbs_naive<<<grid, block>>>(d_seg, d_min_x, d_min_y, d_max_x, d_max_y, w, h);
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // -- 6. Timed run ---------------------------------------------------------
-    reset_bounds();
-
     cudaEvent_t ev_start, ev_stop;
     CUDA_CHECK(cudaEventCreate(&ev_start));
     CUDA_CHECK(cudaEventCreate(&ev_stop));
 
-    CUDA_CHECK(cudaEventRecord(ev_start));
-    find_aabbs_naive<<<grid, block>>>(d_seg, d_min_x, d_min_y, d_max_x, d_max_y, w, h);
-    CUDA_CHECK(cudaEventRecord(ev_stop));
-    CUDA_CHECK(cudaEventSynchronize(ev_stop));
+    // Helper: warm up then time a kernel launch, leaving results in the bound arrays.
+    auto time_kernel = [&](auto kernel_fn, const char* label) -> float {
+        // Warm-up -- absorbs driver init and JIT overhead.
+        reset_bounds();
+        kernel_fn();
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-    float kernel_ms = 0.f;
-    CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, ev_start, ev_stop));
-    printf("Kernel time: %.4f ms\n", kernel_ms);
+        // Timed run.
+        reset_bounds();
+        CUDA_CHECK(cudaEventRecord(ev_start));
+        kernel_fn();
+        CUDA_CHECK(cudaEventRecord(ev_stop));
+        CUDA_CHECK(cudaEventSynchronize(ev_stop));
 
-    // -- 7. Download and print results ----------------------------------------
+        float ms = 0.f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
+        printf("%-30s  %.4f ms\n", label, ms);
+        return ms;
+    };
+
+    // -- 5. Run and time both kernels -----------------------------------------
+    printf("\n%-30s  %s\n", "Kernel", "Time");
+    printf("----------------------------------------------\n");
+
+    time_kernel([&]() {
+        find_aabbs_naive<<<grid, block>>>(d_seg, d_min_x, d_min_y, d_max_x, d_max_y, w, h);
+    }, "find_aabbs_naive");
+
+    float shared_ms = time_kernel([&]() {
+        find_aabbs_shared<<<grid, block>>>(d_seg, d_min_x, d_min_y, d_max_x, d_max_y, w, h);
+    }, "find_aabbs_shared");
+
+    // -- 6. Download and print results ----------------------------------------
+    // Results in the bound arrays are from the last kernel (find_aabbs_shared).
     std::vector<int> h_min_x(MAX_IDS), h_min_y(MAX_IDS);
     std::vector<int> h_max_x(MAX_IDS), h_max_y(MAX_IDS);
     CUDA_CHECK(cudaMemcpy(h_min_x.data(), d_min_x, MAX_IDS*sizeof(int), cudaMemcpyDeviceToHost));
@@ -180,7 +279,7 @@ int main(int argc, char* argv[])
                h_max_y[id] - h_min_y[id] + 1);
     }
 
-    // -- 8. Save result image with bounding-box overlays ----------------------
+    // -- 7. Save result image with bounding-box overlays ----------------------
     auto rgb_result = colourise(seg_int, w, h);
     for (int id = 1; id < MAX_IDS; ++id) {
         if (h_min_x[id] == INT_MAX) continue;
@@ -195,7 +294,7 @@ int main(int argc, char* argv[])
         printf("Saved result.png\n");
     }
 
-    // -- 9. Clean up ----------------------------------------------------------
+    // -- 8. Clean up ----------------------------------------------------------
     cudaFree(d_seg);
     cudaFree(d_min_x); cudaFree(d_min_y);
     cudaFree(d_max_x); cudaFree(d_max_y);
