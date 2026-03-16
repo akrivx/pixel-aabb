@@ -6,7 +6,9 @@
 // then launches one CUDA thread per pixel. Each thread atomically widens the
 // AABB for its object in four global arrays (min_x, min_y, max_x, max_y).
 //
-// Usage:  pixel_aabb [segmentation.png]
+// Usage:  pixel_aabb [path/to/segmentation.png]
+//         Defaults to assets/segmentation.png relative to the source tree (absolute
+//         path baked in at build time via DEFAULT_SEG_PATH compile definition).
 //
 // Outputs:
 //   result.png  -- colourised segmentation with white bounding-box overlays
@@ -78,7 +80,7 @@ __global__ void find_aabbs_naive(
 
 int main(int argc, char* argv[])
 {
-    const char* seg_path = (argc > 1) ? argv[1] : "segmentation.png";
+    const char* seg_path = (argc > 1) ? argv[1] : DEFAULT_SEG_PATH;
 
     // -- 1. Load segmentation PNG ---------------------------------------------
     //

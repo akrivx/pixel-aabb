@@ -37,6 +37,10 @@ target_link_libraries(generate_seg PRIVATE stb_impl)
 # --- pixel_aabb: loads segmentation.png, finds AABBs on GPU, saves result.png -
 add_executable(pixel_aabb pixel_aabb.cu)
 target_link_libraries(pixel_aabb PRIVATE stb_impl)
+# Bake the absolute path to assets/ into the binary so the default input works
+# regardless of the working directory the executable is invoked from.
+target_compile_definitions(pixel_aabb PRIVATE
+    DEFAULT_SEG_PATH="${CMAKE_SOURCE_DIR}/assets/segmentation.png")
 target_compile_options(pixel_aabb PRIVATE
     # -lineinfo embeds source-line info without full debug symbols --
     # essential for meaningful Nsight profiler source attribution.
