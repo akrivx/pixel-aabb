@@ -1,16 +1,18 @@
-cmake_minimum_required(VERSION 3.18)
+cmake_minimum_required(VERSION 3.24)
 project(pixel_aabb LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD  17)
 set(CMAKE_CUDA_STANDARD 17)
 
 # --- GPU architecture ---------------------------------------------------------
-# Adjust to match your GPU:
-#   75 -> Turing  (RTX 20xx, GTX 16xx)
-#   86 -> Ampere  (RTX 30xx)
-#   89 -> Ada     (RTX 40xx)
-#   90 -> Hopper  (H100)
-set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA GPU architecture(s)")
+# "native" (CMake >= 3.24) detects the installed GPU automatically.
+# Override on the command line if cross-compiling or targeting a different GPU:
+#   cmake -DCMAKE_CUDA_ARCHITECTURES=75   # Turing  (RTX 20xx, GTX 16xx)
+#   cmake -DCMAKE_CUDA_ARCHITECTURES=86   # Ampere  (RTX 30xx)
+#   cmake -DCMAKE_CUDA_ARCHITECTURES=89   # Ada     (RTX 40xx)
+#   cmake -DCMAKE_CUDA_ARCHITECTURES=90   # Hopper  (H100)
+# To find your GPU's compute capability: nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA GPU architecture(s)")
 
 # --- stb (header-only) -------------------------------------------------------
 # FetchContent downloads stb on the first configure. No manual steps needed.

@@ -37,9 +37,17 @@ the first configure — no manual steps required.
 ## Build
 
 ```bash
-# From the repo root:
-cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=86   # adjust for your GPU
+# From the repo root (CMake 3.24+ detects your GPU automatically):
+cmake -S . -B build
 cmake --build build --config Release
+```
+
+The default `CMAKE_CUDA_ARCHITECTURES=native` compiles for the GPU installed in
+the build machine. To target a different GPU (e.g. for cross-compilation), pass
+the architecture explicitly:
+
+```bash
+cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=75
 ```
 
 GPU architecture values:
@@ -50,6 +58,16 @@ GPU architecture values:
 | 86 | Ampere (RTX 30xx) |
 | 89 | Ada (RTX 40xx) |
 | 90 | Hopper (H100) |
+
+To find your GPU's compute capability:
+
+```bash
+nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+```
+
+> **Note:** Compiling for the wrong architecture produces a binary that silently
+> runs zero kernel threads — all AABB bounds will remain at `INT_MAX`. Always
+> verify the architecture matches your GPU before concluding the kernel is broken.
 
 Binaries are written to `build/Release/` on Windows or `build/` on Linux.
 
