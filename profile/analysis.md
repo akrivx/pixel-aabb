@@ -168,9 +168,13 @@ This secondary effect compounds the contention: even if two threads are updating
 | Avg. Divergent Branches | 0 |
 | Excessive L2 sectors (uncoalesced) | 8 (0.004% of 194,580 total) |
 
-Memory access coalescing is essentially perfect. A warp of 32 threads reads 32 consecutive `int` pixels (the segmentation row stride is the image width, and `x` increments by 1 per thread), which maps to exactly one 128-byte cache line per 32 threads. The hardware combines those 32 loads into a single L2 request -- this is coalescing working correctly.
+The two array types in this kernel have fundamentally different access patterns and must be considered separately.
 
-There are only 8 "excessive" (uncoalesced) sectors in the entire kernel execution. Coalescing is not a concern.
+**Segmentation read -- perfectly coalesced.** A warp of 32 threads reads 32 consecutive `int` pixels (x increments by 1 per thread, row stride is the image width). Those 32 addresses are contiguous, mapping to exactly one 128-byte cache line. The hardware combines all 32 loads into a single L2 request. This is coalescing working as intended.
+
+**Bounds arrays -- scattered, but harmless at this scale.** Each thread computes `id = seg[y*w + x]` and then issues `atomicMin(&min_x[id], x)`. Within a warp, those `id` values are whatever objects happen to fall in the 32-pixel row -- potentially several different values. Each thread targets a different index in `min_x[]`, which is a gather pattern and is not coalesced. However, all four bounds arrays together are only 4 KB (256 ints x 4 arrays x 4 bytes), occupying roughly 32 cache lines in total. Even with scattered accesses, different threads in the same warp are likely hitting the same small set of cache lines, so the number of distinct L2 requests per warp stays low.
+
+This is why ncu reports only 8 excessive sectors across the entire kernel -- the working set is so small that scatter does not translate into real cache line waste. On a larger ID space (say, 16-bit IDs with 65,536 objects), the bounds arrays would be orders of magnitude larger, scatter would produce many more distinct cache line requests per warp, and uncoalesced access would become a measurable cost.
 
 Branch divergence is negligible (0 divergent branches). The predicated-off threads for background pixels (`if (id == 0) return`) are handled efficiently.
 
