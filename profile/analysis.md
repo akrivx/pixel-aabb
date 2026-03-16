@@ -145,7 +145,7 @@ The remaining ~220 stall cycles include other categories (scoreboard waits, memo
 
 **Theoretical occupancy is 100%.** The binding resource constraint is the warp limit: each block uses 8 warps (256 threads / 32 threads per warp), and a Turing SM supports 32 warps, so 4 blocks fit per SM without hitting any other limit. 4 blocks x 8 warps = 32 warps = 100% of the warp slots.
 
-**Achieved occupancy is 84.6%** (27 warps instead of 32). The gap is minor and ncu estimates only a 15% speedup from closing it. More importantly, occupancy is **not the root problem**: even with 27 active warps per scheduler (6.89 per sub-partition), almost none of them are eligible. Adding more warps would not help because they would all stall on the same atomic serialisation bottleneck.
+**Achieved occupancy is 84.6%** (27 warps instead of 32). The gap is minor and ncu estimates only a 15% speedup from closing it. More importantly, occupancy is **not the root problem**: even with 27 active warps per SM (6.89 per sub-partition), almost none of them are eligible. Adding more warps would not help because they would all stall on the same atomic serialisation bottleneck.
 
 ### 3.7 GPU and Memory Workload Distribution -- L2 slice imbalance
 
